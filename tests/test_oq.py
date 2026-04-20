@@ -15,8 +15,10 @@ except ImportError:
 
 from omlx.oq import (
     OQ_LEVELS,
+    _DiscoveredPlan,
     _LEVEL_BITS,
     _OQ_BPW_TARGETS,
+    _LazyTensor,
     _TrackedTensor,
     _bpw_targets_for_level,
     _build_quant_plan,
@@ -28,8 +30,10 @@ from omlx.oq import (
     _is_moe_router,
     _LazyTensorIndex,
     _normalize_quant_path,
+    _position_sensitivity_map,
     _quantize_chunked,
     _should_quantize_tensor,
+    _should_use_low_memory_mode,
     estimate_memory,
     make_predicate,
     resolve_output_name,
@@ -912,6 +916,14 @@ class TestLazyTensorIndex:
         assert isinstance(result, mx.array)
         assert "layer.0.weight" not in idx
 
+    def test_pop_lazy_returns_lazy_tensor(self, sf_file):
+        path, _ = sf_file
+        idx = _LazyTensorIndex([path])
+        result = idx.pop_lazy("layer.0.weight")
+        assert isinstance(result, _LazyTensor)
+        assert result.shape == (4, 8)
+        assert "layer.0.weight" not in idx
+
     def test_pop_missing_raises(self, sf_file):
         path, _ = sf_file
         idx = _LazyTensorIndex([path])
@@ -1012,6 +1024,11 @@ class TestTrackedTensor:
         r = t[:, None, :]
         assert r.shape == (4, 1, 8)
 
+    def test_getitem_ellipsis_slice(self):
+        t = _TrackedTensor((2, 6, 8), "F16", sources=["a"])
+        r = t[..., :4]
+        assert r.shape == (2, 6, 4)
+
     def test_astype(self):
         t = _TrackedTensor((4, 8), "F16", sources=["a"])
         r = t.astype("BF16")
@@ -1028,6 +1045,16 @@ class TestTrackedTensor:
         t = _TrackedTensor((4, 8), "F16", sources=["a"])
         r = t.T
         assert r.shape == (8, 4)
+
+    def test_transpose_method(self):
+        t = _TrackedTensor((2, 4, 8), "F16", sources=["a"])
+        r = t.transpose(0, 2, 1)
+        assert r.shape == (2, 8, 4)
+
+    def test_swapaxes_method(self):
+        t = _TrackedTensor((2, 4, 8), "F16", sources=["a"])
+        r = t.swapaxes(-1, -2)
+        assert r.shape == (2, 8, 4)
 
     def test_size_property(self):
         t = _TrackedTensor((4, 8), "F16", sources=["a"])
@@ -1090,6 +1117,114 @@ class TestDiscoverSanitizePlan:
         assert plan is not None
         assert "model.embed_tokens.weight" not in plan
         assert len(plan) == len(tensors) - 1
+
+    def test_split_then_contiguous_sanitize(self, sf_file):
+        path, _ = sf_file
+        idx = _LazyTensorIndex([path])
+
+        def gemma4_style_sanitize(weights):
+            sanitized = {}
+            for k, v in weights.items():
+                if k.endswith("gate_proj.weight"):
+                    gate, up = map(mx.contiguous, mx.split(v, 2, axis=-2))
+                    sanitized[k.replace("gate_proj.weight", "split_gate.weight")] = gate
+                    sanitized[k.replace("gate_proj.weight", "split_up.weight")] = up
+                else:
+                    sanitized[k] = v
+            return sanitized
+
+        plan = _discover_sanitize_plan(gemma4_style_sanitize, idx)
+        assert plan is not None
+        gate = plan["model.layers.0.mlp.split_gate.weight"]
+        up = plan["model.layers.0.mlp.split_up.weight"]
+        assert gate["transform"].startswith("split_")
+        assert up["transform"].startswith("split_")
+
+    def test_vlm_gemma4_swapaxes_slice_sanitize(self, sf_file):
+        path, _ = sf_file
+        idx = _LazyTensorIndex([path])
+
+        def vlm_gemma4_style_sanitize(weights):
+            sanitized = {}
+            for k, v in weights.items():
+                if k.endswith("gate_proj.weight"):
+                    v = v.swapaxes(-1, -2)
+                    mid_dim = v.shape[-1] // 2
+                    sanitized[k.replace("gate_proj.weight", "split_gate.weight")] = v[..., :mid_dim].swapaxes(-1, -2)
+                    sanitized[k.replace("gate_proj.weight", "split_up.weight")] = v[..., mid_dim:].swapaxes(-1, -2)
+                else:
+                    sanitized[k] = v
+            return sanitized
+
+        plan = _discover_sanitize_plan(vlm_gemma4_style_sanitize, idx)
+        assert plan is not None
+        assert plan["model.layers.0.mlp.split_gate.weight"]["shape"] == (8, 8)
+        assert plan["model.layers.0.mlp.split_up.weight"]["shape"] == (8, 8)
+
+    def test_vlm_gemma4_swapaxes_slice_replay_preserves_expert_layout(self, tmp_path):
+        path = tmp_path / "moe.safetensors"
+        gate_up = np.arange(2 * 8 * 4, dtype=np.float16).reshape(2, 8, 4)
+        _write_safetensors(
+            str(path),
+            {"model.layers.0.experts.gate_up_proj": gate_up},
+        )
+        idx = _LazyTensorIndex([str(path)])
+
+        def vlm_gemma4_style_sanitize(weights):
+            sanitized = {}
+            for k, v in weights.items():
+                v = v.swapaxes(-1, -2)
+                mid_dim = v.shape[-1] // 2
+                sanitized["split_gate"] = v[..., :mid_dim].swapaxes(-1, -2)
+                sanitized["split_up"] = v[..., mid_dim:].swapaxes(-1, -2)
+            return sanitized
+
+        plan = _discover_sanitize_plan(vlm_gemma4_style_sanitize, idx)
+        discovered = _DiscoveredPlan(plan, _LazyTensorIndex([str(path)]))
+
+        gate = np.array(discovered.pop("split_gate"))
+        up = np.array(discovered.pop("split_up"))
+
+        expected = gate_up.swapaxes(-1, -2)
+        mid_dim = expected.shape[-1] // 2
+        expected_gate = expected[..., :mid_dim].swapaxes(-1, -2)
+        expected_up = expected[..., mid_dim:].swapaxes(-1, -2)
+
+        assert gate.shape == expected_gate.shape
+        assert up.shape == expected_up.shape
+        np.testing.assert_array_equal(gate, expected_gate)
+        np.testing.assert_array_equal(up, expected_up)
+
+    def test_discovered_plan_pop_lazy_passthrough(self, sf_file):
+        path, _ = sf_file
+        idx = _LazyTensorIndex([path])
+
+        def identity_sanitize(weights):
+            return weights
+
+        plan = _discover_sanitize_plan(identity_sanitize, idx)
+        discovered = _DiscoveredPlan(plan, idx)
+        result = discovered.pop_lazy("model.layers.0.self_attn.q_proj.weight")
+        assert isinstance(result, _LazyTensor)
+        assert result.shape == (8, 8)
+
+
+class TestLowMemoryHelpers:
+    def test_position_sensitivity_map_emphasizes_edges(self):
+        sens = _position_sensitivity_map({"num_hidden_layers": 32})
+        assert sens["0"] == pytest.approx(0.05)
+        assert sens["3"] == pytest.approx(0.05)
+        assert sens["4"] == pytest.approx(0.02)
+        assert sens["16"] == pytest.approx(0.01)
+        assert sens["28"] == pytest.approx(0.05)
+
+    def test_should_use_low_memory_mode(self, monkeypatch):
+        monkeypatch.setattr(
+            "omlx.utils.hardware.get_max_working_set_bytes",
+            lambda: 64 * 1024**3,
+        )
+        assert _should_use_low_memory_mode(70 * 1024**3) is True
+        assert _should_use_low_memory_mode(50 * 1024**3) is False
 
 
 # =============================================================================

@@ -397,7 +397,8 @@ def _collect_named_weight_shapes_from_model(model) -> dict[str, tuple]:
 def _collect_named_weight_shapes_from_weights(weights: dict[str, Any]) -> dict[str, tuple]:
     """Collect quantizable weight shapes from sanitized weight tensors."""
     named_shapes = {}
-    for name, tensor in weights.items():
+    items = weights.shape_items() if hasattr(weights, "shape_items") else weights.items()
+    for name, tensor in items:
         norm_name = _normalize_quant_path(name)
         if name != f"{norm_name}.weight":
             continue
@@ -720,68 +721,155 @@ class _TrackedTensor:
     """Fake tensor proxy that records shape, dtype, lineage, and transforms
     applied during a sanitize() dry run. Holds no GPU data."""
 
-    __slots__ = ("shape", "ndim", "dtype", "sources", "transform", "axis")
+    __slots__ = (
+        "shape",
+        "ndim",
+        "dtype",
+        "sources",
+        "transform",
+        "axis",
+        "recipe",
+    )
 
-    def __init__(self, shape, dtype, sources=None, transform="passthrough", axis=None):
+    def __init__(
+        self,
+        shape,
+        dtype,
+        sources=None,
+        transform="passthrough",
+        axis=None,
+        recipe=None,
+    ):
         self.shape = tuple(shape)
         self.ndim = len(self.shape)
         self.dtype = dtype
-        self.sources = sources or []
+        if recipe is None and sources:
+            if len(sources) == 1:
+                recipe = {"op": "source", "key": sources[0]}
+            else:
+                recipe = {"op": "multi_source", "keys": list(sources)}
+        self.recipe = recipe
+        self.sources = list(sources or _recipe_sources(recipe))
         self.transform = transform
         self.axis = axis
 
-    def _clone(self, shape=None, dtype=None, transform=None):
+    def _clone(self, shape=None, dtype=None, transform=None, axis=None, recipe=None):
         return _TrackedTensor(
             shape if shape is not None else self.shape,
             dtype if dtype is not None else self.dtype,
             list(self.sources),
             transform if transform is not None else self.transform,
+            axis if axis is not None else self.axis,
+            recipe if recipe is not None else self.recipe,
         )
 
     # Arithmetic — recipe is "fp8_dequant" for the whole sanitize block if weight came from FP8
     def __add__(self, other):
-        return self._clone(transform="add")
+        return self._clone(
+            transform="add",
+            recipe={"op": "add", "lhs": self.recipe, "rhs": other},
+        )
     def __radd__(self, other):
         return self.__add__(other)
     def __sub__(self, other):
-        return self._clone(transform="sub")
+        return self._clone(
+            transform="sub",
+            recipe={"op": "sub", "lhs": self.recipe, "rhs": other},
+        )
     def __mul__(self, other):
-        return self._clone(transform="mul")
+        return self._clone(
+            transform="mul",
+            recipe={"op": "mul", "lhs": self.recipe, "rhs": other},
+        )
     def __rmul__(self, other):
         return self.__mul__(other)
     def __truediv__(self, other):
-        return self._clone(transform="div")
+        return self._clone(
+            transform="div",
+            recipe={"op": "div", "lhs": self.recipe, "rhs": other},
+        )
+
+    @staticmethod
+    def _slice_len(dim_size, part):
+        start, stop, step = part.indices(dim_size)
+        if step > 0:
+            if start >= stop:
+                return 0
+            return ((stop - start - 1) // step) + 1
+        if start <= stop:
+            return 0
+        return ((start - stop - 1) // (-step)) + 1
 
     # Indexing: handle slice + None (broadcast) + tuple variants
     def __getitem__(self, idx):
         new_shape = list(self.shape)
         # Handle None-broadcasting like scale[:, None, :, None]
         if isinstance(idx, tuple):
+            expanded = []
+            non_ellipsis = sum(1 for part in idx if part is not Ellipsis and part is not None)
+            ellipsis_dims = max(0, len(new_shape) - non_ellipsis)
+            ellipsis_used = False
+            for part in idx:
+                if part is Ellipsis and not ellipsis_used:
+                    expanded.extend([slice(None)] * ellipsis_dims)
+                    ellipsis_used = True
+                else:
+                    expanded.append(part)
+            if not ellipsis_used:
+                expanded.extend([slice(None)] * max(0, len(new_shape) - non_ellipsis))
+
             result_shape = []
             axis = 0
-            for part in idx:
+            for part in expanded:
                 if part is None:
                     result_shape.append(1)
                 elif isinstance(part, slice):
                     if axis < len(new_shape):
-                        result_shape.append(new_shape[axis])
+                        result_shape.append(self._slice_len(new_shape[axis], part))
                         axis += 1
                     else:
                         result_shape.append(1)
-                else:
+                elif isinstance(part, int):
                     # int index → dimension removed
                     if axis < len(new_shape):
+                        axis += 1
+                else:
+                    if axis < len(new_shape):
+                        result_shape.append(new_shape[axis])
                         axis += 1
             while axis < len(new_shape):
                 result_shape.append(new_shape[axis])
                 axis += 1
-            return _TrackedTensor(result_shape, self.dtype, list(self.sources), "slice")
+            return _TrackedTensor(
+                result_shape,
+                self.dtype,
+                list(self.sources),
+                "slice",
+                recipe={"op": "slice", "source": self.recipe, "index": idx},
+            )
         if isinstance(idx, slice):
-            return self._clone(transform="slice")
+            if new_shape:
+                new_shape[0] = self._slice_len(new_shape[0], idx)
+            return _TrackedTensor(
+                new_shape,
+                self.dtype,
+                list(self.sources),
+                "slice",
+                recipe={"op": "slice", "source": self.recipe, "index": idx},
+            )
         # int or other
         if new_shape:
-            return _TrackedTensor(new_shape[1:], self.dtype, list(self.sources), "slice")
-        return self._clone(transform="slice")
+            return _TrackedTensor(
+                new_shape[1:],
+                self.dtype,
+                list(self.sources),
+                "slice",
+                recipe={"op": "slice", "source": self.recipe, "index": idx},
+            )
+        return self._clone(
+            transform="slice",
+            recipe={"op": "slice", "source": self.recipe, "index": idx},
+        )
 
     def reshape(self, *new_shape):
         if len(new_shape) == 1 and isinstance(new_shape[0], (tuple, list)):
@@ -802,14 +890,54 @@ class _TrackedTensor:
                 known_prod *= d
         if unknown_idx >= 0 and known_prod > 0:
             resolved[unknown_idx] = total // known_prod
-        return _TrackedTensor(tuple(resolved), self.dtype, list(self.sources), "reshape")
+        return _TrackedTensor(
+            tuple(resolved),
+            self.dtype,
+            list(self.sources),
+            "reshape",
+            recipe={"op": "reshape", "source": self.recipe, "shape": tuple(resolved)},
+        )
 
     def astype(self, dtype):
-        return _TrackedTensor(self.shape, dtype, list(self.sources), "astype")
+        return _TrackedTensor(
+            self.shape,
+            dtype,
+            list(self.sources),
+            "astype",
+            recipe={"op": "astype", "source": self.recipe, "dtype": dtype},
+        )
+
+    def transpose(self, *axes):
+        if not axes:
+            axes = tuple(reversed(range(self.ndim)))
+        elif len(axes) == 1 and isinstance(axes[0], (tuple, list)):
+            axes = tuple(axes[0])
+        axes = tuple(a + self.ndim if a < 0 else a for a in axes)
+        return _TrackedTensor(
+            tuple(self.shape[a] for a in axes),
+            self.dtype,
+            list(self.sources),
+            "transpose",
+            recipe={"op": "transpose", "source": self.recipe, "axes": axes},
+        )
+
+    def swapaxes(self, axis1, axis2):
+        axis1 = axis1 + self.ndim if axis1 < 0 else axis1
+        axis2 = axis2 + self.ndim if axis2 < 0 else axis2
+        order = list(range(self.ndim))
+        order[axis1], order[axis2] = order[axis2], order[axis1]
+        return self.transpose(order)
 
     @property
     def T(self):
-        return _TrackedTensor(tuple(reversed(self.shape)), self.dtype, list(self.sources), "transpose")
+        axes = tuple(reversed(range(self.ndim)))
+        return _TrackedTensor(
+            tuple(reversed(self.shape)),
+            self.dtype,
+            list(self.sources),
+            "transpose",
+            recipe={"op": "transpose", "source": self.recipe, "axes": axes},
+        )
 
     @property
     def size(self):
@@ -817,6 +945,31 @@ class _TrackedTensor:
         for d in self.shape:
             r *= d
         return r
+
+
+def _recipe_sources(recipe):
+    if not isinstance(recipe, dict):
+        return []
+    op = recipe.get("op")
+    if op == "source":
+        key = recipe.get("key")
+        return [key] if key is not None else []
+    if op in ("stack", "concatenate"):
+        srcs = []
+        for item in recipe.get("items", []):
+            srcs.extend(_recipe_sources(item))
+        return srcs
+    if op in ("add", "sub", "mul", "div"):
+        srcs = _recipe_sources(recipe.get("lhs"))
+        rhs = recipe.get("rhs")
+        if isinstance(rhs, dict):
+            srcs.extend(_recipe_sources(rhs))
+        return srcs
+    if "source" in recipe:
+        return _recipe_sources(recipe["source"])
+    if op == "multi_source":
+        return list(recipe.get("keys", []))
+    return []
 
 
 
@@ -959,6 +1112,7 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
         "synchronize": mx.synchronize,
         "moveaxis": mx.moveaxis,
         "transpose": mx.transpose,
+        "contiguous": getattr(mx, "contiguous", None),
         "from_fp8": getattr(mx, "from_fp8", None),
         "pad": getattr(mx, "pad", None),
     }
@@ -971,7 +1125,18 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
             all_src = []
             for t in tensors:
                 all_src.extend(t.sources)
-            return _TrackedTensor(new_shape, tensors[0].dtype, all_src, "stack", axis=axis)
+            return _TrackedTensor(
+                new_shape,
+                tensors[0].dtype,
+                all_src,
+                "stack",
+                axis=axis,
+                recipe={
+                    "op": "stack",
+                    "axis": axis,
+                    "items": [t.recipe for t in tensors],
+                },
+            )
         return _orig["stack"](tensors, axis=axis)
 
     def _fake_concatenate(tensors, axis=0):
@@ -981,7 +1146,18 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
                 all_src.extend(t.sources)
             base = list(tensors[0].shape)
             base[axis] = sum(t.shape[axis] for t in tensors)
-            return _TrackedTensor(base, tensors[0].dtype, all_src, "concatenate", axis=axis)
+            return _TrackedTensor(
+                base,
+                tensors[0].dtype,
+                all_src,
+                "concatenate",
+                axis=axis,
+                recipe={
+                    "op": "concatenate",
+                    "axis": axis,
+                    "items": [t.recipe for t in tensors],
+                },
+            )
         return _orig["concatenate"](tensors, axis=axis)
 
     def _fake_split(tensor, indices_or_sections, axis=0):
@@ -993,7 +1169,22 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
                 for i in range(n):
                     sh = list(tensor.shape)
                     sh[axis] = sz
-                    parts.append(_TrackedTensor(sh, tensor.dtype, list(tensor.sources), f"split_{i}_{n}", axis=axis))
+                    parts.append(
+                        _TrackedTensor(
+                            sh,
+                            tensor.dtype,
+                            list(tensor.sources),
+                            f"split_{i}_{n}",
+                            axis=axis,
+                            recipe={
+                                "op": "split",
+                                "source": tensor.recipe,
+                                "indices_or_sections": n,
+                                "axis": axis,
+                                "index": i,
+                            },
+                        )
+                    )
                 return parts
             # list of indices
             parts = []
@@ -1002,7 +1193,22 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
             for i, idx in enumerate(idxs):
                 sh = list(tensor.shape)
                 sh[axis] = idx - prev
-                parts.append(_TrackedTensor(sh, tensor.dtype, list(tensor.sources), f"split_{i}", axis=axis))
+                parts.append(
+                    _TrackedTensor(
+                        sh,
+                        tensor.dtype,
+                        list(tensor.sources),
+                        f"split_{i}",
+                        axis=axis,
+                        recipe={
+                            "op": "split",
+                            "source": tensor.recipe,
+                            "indices_or_sections": list(indices_or_sections),
+                            "axis": axis,
+                            "index": i,
+                        },
+                    )
+                )
                 prev = idx
             return parts
         return _orig["split"](tensor, indices_or_sections, axis=axis)
@@ -1012,7 +1218,18 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
             dims = list(range(tensor.ndim))
             dims.insert(dst_ax, dims.pop(src_ax))
             new_shape = tuple(tensor.shape[d] for d in dims)
-            return _TrackedTensor(new_shape, tensor.dtype, list(tensor.sources), "moveaxis")
+            return _TrackedTensor(
+                new_shape,
+                tensor.dtype,
+                list(tensor.sources),
+                "moveaxis",
+                recipe={
+                    "op": "moveaxis",
+                    "source": tensor.recipe,
+                    "src_ax": src_ax,
+                    "dst_ax": dst_ax,
+                },
+            )
         return _orig["moveaxis"](tensor, src_ax, dst_ax)
 
     def _fake_transpose(tensor, axes=None):
@@ -1020,8 +1237,25 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
             if axes is None:
                 axes = list(reversed(range(tensor.ndim)))
             new_shape = tuple(tensor.shape[a] for a in axes)
-            return _TrackedTensor(new_shape, tensor.dtype, list(tensor.sources), "transpose")
+            return _TrackedTensor(
+                new_shape,
+                tensor.dtype,
+                list(tensor.sources),
+                "transpose",
+                recipe={
+                    "op": "transpose",
+                    "source": tensor.recipe,
+                    "axes": tuple(axes),
+                },
+            )
         return _orig["transpose"](tensor, axes=axes)
+
+    def _fake_contiguous(tensor, *args, **kwargs):
+        if isinstance(tensor, _TrackedTensor):
+            # Discovery only cares about lineage and resulting shape.
+            # contiguity does not change either, so keep the original recipe.
+            return tensor
+        return _orig["contiguous"](tensor, *args, **kwargs) if _orig["contiguous"] else tensor
 
     def _noop(*a, **kw): pass
 
@@ -1033,10 +1267,23 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
     mx.synchronize = _noop
     mx.moveaxis = _fake_moveaxis
     mx.transpose = _fake_transpose
+    if _orig["contiguous"] is not None:
+        mx.contiguous = _fake_contiguous
 
     def _fake_from_fp8(x, dtype=None, **kw):
         if isinstance(x, _TrackedTensor):
-            return _TrackedTensor(x.shape, dtype or x.dtype, list(x.sources), "from_fp8")
+            return _TrackedTensor(
+                x.shape,
+                dtype or x.dtype,
+                list(x.sources),
+                "from_fp8",
+                recipe={
+                    "op": "from_fp8",
+                    "source": x.recipe,
+                    "dtype": dtype or x.dtype,
+                    "kwargs": kw,
+                },
+            )
         return _orig["from_fp8"](x, dtype=dtype, **kw) if _orig["from_fp8"] else x
 
     def _fake_pad(x, pad_width, **kw):
@@ -1048,7 +1295,18 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
                     new_shape.append(d + lo + hi)
                 else:
                     new_shape.append(d)
-            return _TrackedTensor(new_shape, x.dtype, list(x.sources), "pad")
+            return _TrackedTensor(
+                new_shape,
+                x.dtype,
+                list(x.sources),
+                "pad",
+                recipe={
+                    "op": "pad",
+                    "source": x.recipe,
+                    "pad_width": pad_width,
+                    "kwargs": kw,
+                },
+            )
         return _orig["pad"](x, pad_width, **kw) if _orig["pad"] else x
 
     if _orig["from_fp8"] is not None:
@@ -1071,6 +1329,7 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
                 "transform": v.transform,
                 "shape": v.shape,
                 "axis": v.axis,
+                "recipe": v.recipe,
             }
         else:
             # sanitize returned a real value (rare — e.g. a scalar override)
@@ -1080,6 +1339,7 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
                 "shape": getattr(v, "shape", ()),
                 "axis": None,
                 "value": v,
+                "recipe": {"op": "literal", "value": v},
             }
 
     return plan
@@ -1118,6 +1378,9 @@ class _DiscoveredPlan:
                 self.ndim = len(self.shape)
         return ((k, _SP(info["shape"])) for k, info in self._plan.items())
 
+    def shape_items(self):
+        return self.items()
+
     def nbytes(self):
         return self._lazy.nbytes()
 
@@ -1143,6 +1406,158 @@ class _DiscoveredPlan:
         mx.eval(arr)
         return arr
 
+    def _pop_lazy_source(self, src_key):
+        if hasattr(self._lazy, "pop_lazy"):
+            try:
+                return self._lazy.pop_lazy(src_key)
+            except KeyError:
+                return None
+        meta = self._lazy._index.pop(src_key, None)
+        if meta is None:
+            return None
+        return _LazyTensor(*meta)
+
+    def _materialize_recipe(self, recipe):
+        if not isinstance(recipe, dict):
+            return recipe
+
+        op = recipe.get("op")
+
+        if op == "literal":
+            return recipe.get("value")
+
+        if op == "source":
+            return self._materialize_source(recipe["key"])
+
+        if op == "stack":
+            axis = recipe.get("axis", 0)
+            items = recipe.get("items", [])
+            chunk = self._STACK_CHUNK
+            partials = []
+            for base in range(0, len(items), chunk):
+                piece = [
+                    self._materialize_recipe(item)
+                    for item in items[base:base + chunk]
+                ]
+                stk = mx.stack(piece, axis=axis)
+                mx.eval(stk)
+                del piece
+                mx.clear_cache()
+                partials.append(stk)
+            if len(partials) == 1:
+                return partials[0]
+            result = mx.concatenate(partials, axis=axis)
+            mx.eval(result)
+            del partials
+            mx.clear_cache()
+            return result
+
+        if op == "concatenate":
+            axis = recipe.get("axis", 0)
+            parts = [self._materialize_recipe(item) for item in recipe.get("items", [])]
+            result = mx.concatenate(parts, axis=axis)
+            mx.eval(result)
+            del parts
+            mx.clear_cache()
+            return result
+
+        if op == "split":
+            arr = self._materialize_recipe(recipe.get("source"))
+            chunks = mx.split(
+                arr,
+                recipe.get("indices_or_sections"),
+                axis=recipe.get("axis", 0),
+            )
+            result = chunks[recipe.get("index", 0)]
+            mx.eval(result)
+            del arr, chunks
+            mx.clear_cache()
+            return result
+
+        if op == "moveaxis":
+            arr = self._materialize_recipe(recipe.get("source"))
+            result = mx.moveaxis(arr, recipe.get("src_ax"), recipe.get("dst_ax"))
+            mx.eval(result)
+            del arr
+            mx.clear_cache()
+            return result
+
+        if op == "transpose":
+            arr = self._materialize_recipe(recipe.get("source"))
+            result = mx.transpose(arr, axes=recipe.get("axes"))
+            mx.eval(result)
+            del arr
+            mx.clear_cache()
+            return result
+
+        if op == "slice":
+            arr = self._materialize_recipe(recipe.get("source"))
+            result = arr[recipe.get("index")]
+            mx.eval(result)
+            del arr
+            mx.clear_cache()
+            return result
+
+        if op == "reshape":
+            arr = self._materialize_recipe(recipe.get("source"))
+            result = arr.reshape(recipe.get("shape"))
+            mx.eval(result)
+            del arr
+            mx.clear_cache()
+            return result
+
+        if op == "astype":
+            arr = self._materialize_recipe(recipe.get("source"))
+            result = arr.astype(recipe.get("dtype"))
+            mx.eval(result)
+            del arr
+            mx.clear_cache()
+            return result
+
+        if op in ("add", "sub", "mul", "div"):
+            lhs = self._materialize_recipe(recipe.get("lhs"))
+            rhs = recipe.get("rhs")
+            if isinstance(rhs, dict):
+                rhs = self._materialize_recipe(rhs)
+            if op == "add":
+                result = lhs + rhs
+            elif op == "sub":
+                result = lhs - rhs
+            elif op == "mul":
+                result = lhs * rhs
+            else:
+                result = lhs / rhs
+            mx.eval(result)
+            del lhs
+            mx.clear_cache()
+            return result
+
+        if op == "from_fp8":
+            arr = self._materialize_recipe(recipe.get("source"))
+            kwargs = dict(recipe.get("kwargs") or {})
+            result = mx.from_fp8(arr, dtype=recipe.get("dtype"), **kwargs)
+            mx.eval(result)
+            del arr
+            mx.clear_cache()
+            return result
+
+        if op == "pad":
+            arr = self._materialize_recipe(recipe.get("source"))
+            kwargs = dict(recipe.get("kwargs") or {})
+            result = mx.pad(arr, recipe.get("pad_width"), **kwargs)
+            mx.eval(result)
+            del arr
+            mx.clear_cache()
+            return result
+
+        if op == "multi_source":
+            keys = recipe.get("keys", [])
+            if not keys:
+                raise ValueError("multi_source recipe without keys")
+            return self._materialize_source(keys[0])
+
+        raise ValueError(f"unsupported sanitize recipe op: {op!r}")
+
     def pop(self, key, *default):
         if key not in self._plan:
             if default:
@@ -1152,6 +1567,10 @@ class _DiscoveredPlan:
         info = self._plan.pop(key)
         transform = info["transform"]
         sources = info["sources"]
+        recipe = info.get("recipe")
+
+        if recipe is not None:
+            return self._materialize_recipe(recipe)
 
         if transform == "literal":
             return info["value"]
@@ -1228,6 +1647,21 @@ class _DiscoveredPlan:
             return self._materialize_source(sources[0])
         raise ValueError(f"cannot materialize {key!r}: transform={transform}, no sources")
 
+    def pop_lazy(self, key, *default):
+        if key not in self._plan:
+            if default:
+                return default[0]
+            raise KeyError(key)
+
+        info = self._plan.get(key, {})
+        recipe = info.get("recipe") or {}
+        if recipe.get("op") == "source":
+            lazy = self._pop_lazy_source(recipe["key"])
+            if lazy is not None:
+                self._plan.pop(key, None)
+                return lazy
+        return self.pop(key, *default)
+
 
 
 def validate_quantizable(config: dict) -> bool:
@@ -1284,20 +1718,7 @@ def estimate_bpw_and_size(model_path: str, oq_level: int, group_size: int = 64) 
     _level_targets = _bpw_targets_for_level(oq_level)
     if _level_targets is not None:
         config["_oq_use_budget_plan"] = True
-        tc = config.get("text_config", {})
-        num_layers = (
-            config.get("num_hidden_layers")
-            or tc.get("num_hidden_layers", 32)
-        )
-        pos_sens = {}
-        for i in range(num_layers):
-            if i < num_layers // 8 or i >= 7 * num_layers // 8:
-                pos_sens[str(i)] = 0.05
-            elif i < num_layers // 4 or i >= 3 * num_layers // 4:
-                pos_sens[str(i)] = 0.02
-            else:
-                pos_sens[str(i)] = 0.01
-        config["_oq_sensitivity_map"] = pos_sens
+        config["_oq_sensitivity_map"] = _position_sensitivity_map(config)
 
         named_shapes = {}
         for sf_path in weight_files:
@@ -1384,7 +1805,14 @@ def estimate_bpw_and_size(model_path: str, oq_level: int, group_size: int = 64) 
         default=0,
     )
 
-    streaming_peak = int(source_total * 1.5) + 5 * 1024**3
+    if _should_use_low_memory_mode(source_total):
+        # Rough envelope for lazy per-tensor quantization with smaller shard
+        # flushes. Peak is dominated by one large tensor's quantized outputs,
+        # active work chunks, and transient sanitize state rather than the
+        # whole source model size.
+        streaming_peak = 16 * 1024**3
+    else:
+        streaming_peak = int(source_total * 1.5) + 5 * 1024**3
 
     return {
         "effective_bpw": round(effective_bpw, 2),
@@ -1401,10 +1829,47 @@ def estimate_memory(source_size_bytes: int) -> dict:
     This is a rough estimate used before precise calculation is available.
     The /api/oq/estimate endpoint provides precise values per tensor.
 
-    Streaming: source (mmap) + 5GB output buffer + sanitize overhead
+    Streaming: source (mmap) + output buffer + sanitize overhead.
+    Large source models automatically switch to low-memory mode.
     """
-    peak = source_size_bytes + 6 * 1024**3
+    if _should_use_low_memory_mode(source_size_bytes):
+        peak = 16 * 1024**3
+    else:
+        peak = source_size_bytes + 6 * 1024**3
     return {"peak_bytes": peak, "peak_formatted": _format_size(peak)}
+
+
+def _position_sensitivity_map(config: dict) -> dict[str, float]:
+    """Fallback layer ranking used when real calibration is too memory-heavy."""
+    tc = config.get("text_config", {})
+    num_layers = (
+        config.get("num_hidden_layers")
+        or tc.get("num_hidden_layers", 32)
+    )
+    pos_sens: dict[str, float] = {}
+    for i in range(num_layers):
+        if i < num_layers // 8 or i >= 7 * num_layers // 8:
+            pos_sens[str(i)] = 0.05
+        elif i < num_layers // 4 or i >= 3 * num_layers // 4:
+            pos_sens[str(i)] = 0.02
+        else:
+            pos_sens[str(i)] = 0.01
+    return pos_sens
+
+
+def _should_use_low_memory_mode(source_size_bytes: int) -> bool:
+    """Return True when a temporary full-model calibration load likely won't fit."""
+    if source_size_bytes <= 0:
+        return False
+    try:
+        from .utils.hardware import get_max_working_set_bytes
+
+        max_working_set = get_max_working_set_bytes()
+    except Exception:
+        return False
+    if max_working_set <= 0:
+        return False
+    return source_size_bytes > int(max_working_set * 0.9)
 
 
 def _format_size(size_bytes: int) -> str:
@@ -1420,6 +1885,7 @@ def _format_size(size_bytes: int) -> str:
 
 
 _MAX_SHARD_BYTES = 5_000_000_000
+_LOW_MEMORY_SHARD_BYTES = 1_000_000_000
 
 _SKIP_QUANT_PATTERNS = (
     "layernorm", "rmsnorm", "norm.weight", "norm.bias",
@@ -1664,6 +2130,19 @@ class _LazyTensorIndex:
             for k, v in self._overrides.items():
                 yield k, v
 
+    def shape_items(self):
+        class _SP:
+            __slots__ = ("shape", "ndim")
+            def __init__(self, sh):
+                self.shape = tuple(sh)
+                self.ndim = len(self.shape)
+
+        for k, (_, _, _, _, shape, _) in self._index.items():
+            yield k, _SP(shape)
+        if hasattr(self, "_overrides"):
+            for k, v in self._overrides.items():
+                yield k, v
+
     def get(self, key, default=None):
         if key in self._index:
             return self[key]
@@ -1701,6 +2180,15 @@ class _LazyTensorIndex:
         arr = lt[:]
         mx.eval(arr)
         return arr
+
+    def pop_lazy(self, key, *default):
+        if hasattr(self, "_overrides") and key in self._overrides:
+            return self._overrides.pop(key)
+        if key not in self._index:
+            if default:
+                return default[0]
+            raise KeyError(key)
+        return _LazyTensor(*self._index.pop(key))
 
 
 class _LazyTensor:
@@ -1804,15 +2292,29 @@ def _row_chunks(t, max_elems):
         yield chunk
 
 
-def _quantize_chunked(w, group_size, bits, mode):
+def _quantize_chunked(w, group_size, bits, mode, target_dtype=None):
     _MLX_MAX_ELEMS = 1 << 30
     max_elems = max(group_size, min(_QUANTIZE_CHUNK_BYTES // 2, _MLX_MAX_ELEMS))
+    if (
+        not isinstance(w, _LazyTensor)
+        and target_dtype is not None
+        and mx.issubdtype(w.dtype, mx.floating)
+        and w.dtype != target_dtype
+    ):
+        w = w.astype(target_dtype)
     if not isinstance(w, _LazyTensor) and w.size <= max_elems:
         qw, scales, *rest = mx.quantize(w, group_size=group_size, bits=bits, mode=mode)
         return qw, scales, (rest[0] if rest else None)
     orig = tuple(w.shape)
     qws, scs, bis = [], [], []
     for chunk in _row_chunks(w, max_elems):
+        if (
+            target_dtype is not None
+            and mx.issubdtype(chunk.dtype, mx.floating)
+            and chunk.dtype != target_dtype
+        ):
+            chunk = chunk.astype(target_dtype)
+            mx.eval(chunk)
         flat = chunk.reshape(-1, chunk.shape[-1])
         mx.eval(flat)
         cqw, csc, *crest = mx.quantize(flat, group_size=group_size, bits=bits, mode=mode)
@@ -1846,6 +2348,7 @@ def quantize_oq_streaming(
     hard_cap_bpw: float | None = None,
     sensitivity_model_path: str = "",
     dtype: str = "bfloat16",
+    low_memory: Optional[bool] = None,
 ) -> None:
     """Tensor-by-tensor quantization. Memory: ~3-4GB regardless of model size.
 
@@ -1862,6 +2365,8 @@ def quantize_oq_streaming(
         dtype: Target fp dtype for non-quantized weights and quant scales/biases.
             Must be "bfloat16" (default) or "float16". float16 yields ~20%
             faster prefill on M1/M2 Apple Silicon (native fp16 support).
+        low_memory: Force low-memory mode. When None, auto-enables for source
+            models too large for a temporary calibration load.
     """
     if oq_level not in OQ_LEVELS:
         raise ValueError(
@@ -1891,6 +2396,14 @@ def quantize_oq_streaming(
     weight_files = sorted(source.glob("*.safetensors"))
     if not weight_files:
         raise ValueError(f"No .safetensors files found in {model_path}")
+    source_total_bytes = sum(sf.stat().st_size for sf in weight_files)
+    low_memory_mode = (
+        _should_use_low_memory_mode(source_total_bytes)
+        if low_memory is None else low_memory
+    )
+    shard_flush_bytes = (
+        _LOW_MEMORY_SHARD_BYTES if low_memory_mode else _MAX_SHARD_BYTES
+    )
 
     cb("loading", 8.0)
 
@@ -1900,16 +2413,51 @@ def quantize_oq_streaming(
         f"oQ{oq_level:g} streaming: {len(all_weights)} tensors in "
         f"{len(weight_files)} shards"
     )
+    if low_memory_mode:
+        logger.info(
+            f"oQ{oq_level:g}: low-memory mode enabled "
+            f"(source={_format_size(source_total_bytes)}, "
+            f"flush={_format_size(shard_flush_bytes)})"
+        )
 
     cb("loading", 12.0)
 
     sanitize_fn = _build_model_sanitizer(config)
     if sanitize_fn is not None:
+        def _apply_streaming_sanitize(weights):
+            try:
+                plan = _discover_sanitize_plan(sanitize_fn, weights)
+                discovered = _DiscoveredPlan(plan, weights)
+                logger.info(
+                    f"oQ{oq_level:g}: discovered streaming sanitize plan, "
+                    f"{len(discovered)} output tensors"
+                )
+                return discovered
+            except Exception as e:
+                if low_memory_mode:
+                    raise RuntimeError(
+                        "Streaming sanitize discovery failed in low-memory mode; "
+                        "refusing eager sanitize because it may exceed RAM"
+                    ) from e
+                logger.warning(
+                    f"Streaming discovery failed ({e}), falling back to eager sanitize"
+                )
+                try:
+                    sanitized = sanitize_fn(weights)
+                    logger.info(
+                        f"oQ{oq_level:g}: eager sanitize applied, "
+                        f"{len(sanitized)} tensors"
+                    )
+                    return sanitized
+                except Exception as e2:
+                    logger.warning(f"Sanitize failed ({e2}), using original names")
+                    return weights
+
         # Try discovery-based streaming sanitize first (works for any model,
         # bounds peak memory by materializing one tensor at a time)
         # Check if source contains FP8 weights — discovery can't capture the
         # multi-op dequant chain (from_fp8 + pad + reshape + mul + slice + astype)
-        # as a single replayable transform. Fall back to eager sanitize for those.
+        # as a single replayable transform before dequant.
         has_fp8 = False
         if hasattr(all_weights, "_index"):
             for _k, _meta in all_weights._index.items():
@@ -1923,29 +2471,13 @@ def quantize_oq_streaming(
             try:
                 n_deq = _streaming_fp8_dequant(all_weights)
                 logger.info(f"oQ{oq_level:g}: FP8 dequant complete ({n_deq} tensors)")
-                all_weights = sanitize_fn(all_weights)
-                logger.info(f"oQ{oq_level:g}: sanitize applied, {len(all_weights)} tensors")
+                all_weights = _apply_streaming_sanitize(all_weights)
             except Exception as e:
                 import traceback; traceback.print_exc()
                 logger.warning(f"FP8 sanitize failed ({e}), aborting")
                 raise
         else:
-            try:
-                plan = _discover_sanitize_plan(sanitize_fn, all_weights)
-                all_weights = _DiscoveredPlan(plan, all_weights)
-                logger.info(
-                    f"oQ{oq_level:g}: discovered streaming sanitize plan, "
-                    f"{len(all_weights)} output tensors"
-                )
-            except Exception as e:
-                logger.warning(
-                    f"Streaming discovery failed ({e}), falling back to eager sanitize"
-                )
-                try:
-                    all_weights = sanitize_fn(all_weights)
-                    logger.info(f"oQ{oq_level:g}: eager sanitize applied, {len(all_weights)} tensors")
-                except Exception as e2:
-                    logger.warning(f"Sanitize failed ({e2}), using original names")
+            all_weights = _apply_streaming_sanitize(all_weights)
 
     config["_oq_non_quantizable"] = _build_non_quantizable_set(config)
 
@@ -1956,6 +2488,12 @@ def quantize_oq_streaming(
         sensitivity_map = _measure_sensitivity_from_quantized_model(
             sensitivity_model_path, config, oq_level,
             num_samples=128, seq_length=256,
+        )
+    elif low_memory_mode:
+        sensitivity_map = _position_sensitivity_map(config)
+        logger.info(
+            f"oQ{oq_level:g}: skipping full-model sensitivity in low-memory mode "
+            f"and using position-based layer ranking"
         )
     else:
         logger.info(f"oQ{oq_level:g}: measuring layer sensitivity for streaming path")
@@ -2003,13 +2541,14 @@ def quantize_oq_streaming(
     per_layer_config = {}
     start_time = _time.monotonic()
 
-    total_bytes = sum(sf.stat().st_size for sf in source.glob("*.safetensors"))
+    total_bytes = source_total_bytes
     processed_bytes = 0
 
     for i, tensor_name in enumerate(tensor_names):
-        w_mx = all_weights.pop(tensor_name)
-        if isinstance(w_mx, _LazyTensor):
-            w_mx = w_mx[:]
+        if hasattr(all_weights, "pop_lazy"):
+            w_mx = all_weights.pop_lazy(tensor_name)
+        else:
+            w_mx = all_weights.pop(tensor_name)
         tensor_bytes = w_mx.nbytes
         shape = w_mx.shape
 
@@ -2024,15 +2563,9 @@ def quantize_oq_streaming(
             )
 
             if bits is not None and len(shape) >= 2 and shape[-1] % gs == 0:
-                # Cast to target dtype before quantize: scales/biases inherit
-                # the input dtype, which drives inference speed on Apple
-                # Silicon (M1/M2 prefer float16, M3/M4 handle both).
-                if (
-                    mx.issubdtype(w_mx.dtype, mx.floating)
-                    and w_mx.dtype != target_dtype
-                ):
-                    w_mx = w_mx.astype(target_dtype)
-                qw, scales, biases = _quantize_chunked(w_mx, gs, bits, qmode)
+                qw, scales, biases = _quantize_chunked(
+                    w_mx, gs, bits, qmode, target_dtype=target_dtype,
+                )
 
                 base = tensor_name
                 if base.endswith(".weight"):
@@ -2050,6 +2583,8 @@ def quantize_oq_streaming(
                     layer_cfg["mode"] = qmode
                     per_layer_config[base] = layer_cfg
             else:
+                if isinstance(w_mx, _LazyTensor):
+                    w_mx = w_mx[:]
                 if (
                     mx.issubdtype(w_mx.dtype, mx.floating)
                     and w_mx.dtype != target_dtype
@@ -2057,6 +2592,8 @@ def quantize_oq_streaming(
                     w_mx = w_mx.astype(target_dtype)
                 out_shard_data[tensor_name] = w_mx
         else:
+            if isinstance(w_mx, _LazyTensor):
+                w_mx = w_mx[:]
             if (
                 mx.issubdtype(w_mx.dtype, mx.floating)
                 and w_mx.dtype != target_dtype
@@ -2067,7 +2604,7 @@ def quantize_oq_streaming(
         del w_mx
 
         current_bytes = sum(v.nbytes for v in out_shard_data.values())
-        if current_bytes >= _MAX_SHARD_BYTES:
+        if current_bytes >= shard_flush_bytes:
             shard_name = f"model-{out_shard_idx + 1:05d}-of-PLACEHOLDER.safetensors"
             shard_path = output / shard_name
             mx.save_safetensors(str(shard_path), out_shard_data, metadata={"format": "mlx"})
@@ -2767,5 +3304,3 @@ def _measure_sensitivity_from_quantized_model(
         )
 
     return sensitivity
-
-

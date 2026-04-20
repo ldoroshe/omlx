@@ -151,6 +151,8 @@ For large models (70B+), the streaming path processes tensors one at a time via 
 - Shards flushed at 5 GB boundary.
 - Non-quantized float32 weights cast to bfloat16 for inference parity.
 - Sensitivity measurement requires temporary model load (peak memory ≈ model size).
+- Oversized source models automatically switch to low-memory mode: skip full-model
+  calibration, use position-based layer ranking, and flush smaller output shards.
 
 ## Calibration Data
 
