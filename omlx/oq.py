@@ -461,6 +461,20 @@ _MANDATORY_BOOST_PATTERNS = {
 }
 
 
+def _is_moe_output_projection(path: str) -> bool:
+    """Detect routed expert output projections."""
+    return any(p in path for p in ("down_proj", "w2", "fc2"))
+
+
+def _num_hidden_layers(config: dict, default: int = 0) -> int:
+    """Read layer count from top-level or nested text config."""
+    tc = config.get("text_config", {})
+    try:
+        return int(config.get("num_hidden_layers") or tc.get("num_hidden_layers") or default)
+    except (TypeError, ValueError):
+        return default
+
+
 def _sensitivity_tier(layer_score: float, max_score: float) -> int:
     """Map sensitivity score to boost tier: +4 (top), +2 (high), +1 (moderate).
 
@@ -490,7 +504,9 @@ def _build_quant_plan(
     1. Mandatory pre-allocation: consensus-critical tensors (lm_head → 8-bit)
     2. Data-driven: all non-expert tensors compete equally, ranked by
        layer sensitivity score. Higher sensitivity → more bits.
-    3. Routed experts always stay at base bits (93-98% of params).
+    3. Routed experts normally stay at base bits (93-98% of params), except
+       oQ2.5 gives edge-layer expert output projections a tiny 3-bit floor to
+       reduce low-bit token-loop collapse while staying under the hard cap.
     """
     base_bits = _base_bits_for_level(oq_level)
     base_mode = _mode_for_bits(base_bits)
@@ -550,7 +566,7 @@ def _build_quant_plan(
                 continue
             if not _is_routed_expert(path):
                 continue
-            if not any(p in path for p in ("down_proj", "w2")):
+            if not _is_moe_output_projection(path):
                 continue
             cand_bits = base_bits + 1  # 3→4
             if cand_bits not in (2, 3, 4, 5, 6, 8):
@@ -566,6 +582,51 @@ def _build_quant_plan(
                 boost_map[path] = {"bits": cand_bits, "group_size": cand_gs, "mode": cand_mode}
                 total_bits_f += delta
                 current_bpw = total_bits_f / total_params
+
+    # oQ2.5 anti-collapse floor: keep a small slice of routed expert output
+    # projections at 3-bit near model edges. These layers are cheap enough to
+    # protect under a 2.6 bpw cap and are disproportionately likely to destabilize
+    # generation when left at pure 2-bit.
+    if oq_level == 2.5:
+        num_layers = _num_hidden_layers(config)
+        if num_layers > 0:
+            edge_span = max(1, min(4, num_layers // 16))
+            candidates = []
+            for path, shape in named_shapes.items():
+                if path in boost_map:
+                    continue
+                if not _is_routed_expert(path):
+                    continue
+                if not _is_moe_output_projection(path):
+                    continue
+                layer_idx = _extract_layer_index(path)
+                if layer_idx < 0:
+                    continue
+                edge_distance = min(layer_idx, num_layers - 1 - layer_idx)
+                if edge_distance >= edge_span:
+                    continue
+                layer_score = float(layer_scores.get(str(layer_idx), 0.0))
+                candidates.append((layer_score, -edge_distance, path, shape))
+
+            cand_bits = 3
+            cand_gs = _gs_for_mode(cand_bits, _OQ_DEFAULT_GROUP_SIZE)
+            cand_mode = _mode_for_bits(cand_bits)
+            for _score, _edge_rank, path, shape in sorted(
+                candidates, key=lambda x: (x[0], x[1]), reverse=True
+            ):
+                base_cost = _tensor_quantized_bytes(
+                    shape, base_bits, base_group_size, base_mode
+                )
+                cand_cost = _tensor_quantized_bytes(shape, cand_bits, cand_gs, cand_mode)
+                delta = 8 * (cand_cost - base_cost)
+                if delta <= 0:
+                    continue
+                next_bpw = (total_bits_f + delta) / total_params
+                if next_bpw > hard_cap_bpw:
+                    continue
+                boost_map[path] = {"bits": cand_bits, "group_size": cand_gs, "mode": cand_mode}
+                total_bits_f += delta
+                current_bpw = next_bpw
 
     # Protection floor: apply full protection rules as minimum bits for
     # non-expert tensors. This ensures attention, shared experts, etc. get

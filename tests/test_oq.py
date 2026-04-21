@@ -787,6 +787,40 @@ class TestLevelBudgetPlan:
         assert plan.effective_bpw <= 2.6
         assert all(v["bits"] > 2 for v in plan.boost_map.values())
 
+    def test_oq25_moe_output_floor_for_edge_layers(self):
+        """oQ2.5 gives edge expert output projections a 3-bit anti-collapse floor."""
+        named_shapes = {"lm_head": (4096, 32000)}
+        n_layers = 52
+        n_experts = 64
+        for i in range(n_layers):
+            named_shapes[f"model.layers.{i}.self_attn.v_proj"] = (1024, 4096)
+            named_shapes[f"model.layers.{i}.self_attn.q_proj"] = (4096, 4096)
+            named_shapes[f"model.layers.{i}.self_attn.k_proj"] = (1024, 4096)
+            named_shapes[f"model.layers.{i}.self_attn.o_proj"] = (4096, 1024)
+        for i in range(n_layers):
+            for e in range(n_experts):
+                named_shapes[f"model.layers.{i}.mlp.experts.{e}.down_proj"] = (4096, 1024)
+                named_shapes[f"model.layers.{i}.mlp.experts.{e}.up_proj"] = (1024, 4096)
+                named_shapes[f"model.layers.{i}.mlp.experts.{e}.gate_proj"] = (1024, 4096)
+        config = {
+            "num_hidden_layers": n_layers,
+            "_oq_use_budget_plan": True,
+            "_oq_sensitivity_map": {str(i): 0.1 / (i + 1) for i in range(n_layers)},
+        }
+        plan = _build_quant_plan(
+            named_shapes, config, 2.5, target_bpw=2.5, hard_cap_bpw=2.6
+        )
+        assert plan.effective_bpw <= 2.6
+
+        expert_boosts = [k for k in plan.boost_map if "mlp.experts" in k]
+        assert expert_boosts, "Expected routed expert output protection at oQ2.5"
+        assert all("down_proj" in k for k in expert_boosts)
+        assert all(plan.boost_map[k]["bits"] == 3 for k in expert_boosts)
+
+        boosted_layers = {_extract_layer_index(k) for k in expert_boosts}
+        assert boosted_layers <= {0, 1, 2, 49, 50, 51}
+        assert not any("up_proj" in k or "gate_proj" in k for k in expert_boosts)
+
     def test_oq2_moe_protection_floor(self):
         """oQ2 MoE: protection floor boosts attention, experts stay 2bit."""
         named_shapes = {"lm_head": (4096, 32000)}
