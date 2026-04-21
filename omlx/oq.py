@@ -928,6 +928,33 @@ class _TrackedTensor:
         order[axis1], order[axis2] = order[axis2], order[axis1]
         return self.transpose(order)
 
+    def moveaxis(self, src_ax, dst_ax):
+        src_is_scalar = isinstance(src_ax, int)
+        dst_is_scalar = isinstance(dst_ax, int)
+        src_axes = (src_ax,) if src_is_scalar else tuple(src_ax)
+        dst_axes = (dst_ax,) if dst_is_scalar else tuple(dst_ax)
+        src_axes = tuple(a + self.ndim if a < 0 else a for a in src_axes)
+        dst_axes = tuple(a + self.ndim if a < 0 else a for a in dst_axes)
+
+        order = [axis for axis in range(self.ndim) if axis not in src_axes]
+        for dst, src in sorted(zip(dst_axes, src_axes)):
+            order.insert(dst, src)
+
+        recipe_src = src_axes[0] if src_is_scalar else src_axes
+        recipe_dst = dst_axes[0] if dst_is_scalar else dst_axes
+        return _TrackedTensor(
+            tuple(self.shape[axis] for axis in order),
+            self.dtype,
+            list(self.sources),
+            "moveaxis",
+            recipe={
+                "op": "moveaxis",
+                "source": self.recipe,
+                "src_ax": recipe_src,
+                "dst_ax": recipe_dst,
+            },
+        )
+
     @property
     def T(self):
         axes = tuple(reversed(range(self.ndim)))
@@ -1215,21 +1242,7 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
 
     def _fake_moveaxis(tensor, src_ax, dst_ax):
         if isinstance(tensor, _TrackedTensor):
-            dims = list(range(tensor.ndim))
-            dims.insert(dst_ax, dims.pop(src_ax))
-            new_shape = tuple(tensor.shape[d] for d in dims)
-            return _TrackedTensor(
-                new_shape,
-                tensor.dtype,
-                list(tensor.sources),
-                "moveaxis",
-                recipe={
-                    "op": "moveaxis",
-                    "source": tensor.recipe,
-                    "src_ax": src_ax,
-                    "dst_ax": dst_ax,
-                },
-            )
+            return tensor.moveaxis(src_ax, dst_ax)
         return _orig["moveaxis"](tensor, src_ax, dst_ax)
 
     def _fake_transpose(tensor, axes=None):

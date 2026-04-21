@@ -1056,6 +1056,12 @@ class TestTrackedTensor:
         r = t.swapaxes(-1, -2)
         assert r.shape == (2, 8, 4)
 
+    def test_moveaxis_method(self):
+        t = _TrackedTensor((2, 4, 6, 8), "F16", sources=["a"])
+        r = t.moveaxis(2, 1)
+        assert r.shape == (2, 6, 4, 8)
+        assert r.transform == "moveaxis"
+
     def test_size_property(self):
         t = _TrackedTensor((4, 8), "F16", sources=["a"])
         assert t.size == 32
@@ -1194,6 +1200,33 @@ class TestDiscoverSanitizePlan:
         assert up.shape == expected_up.shape
         np.testing.assert_array_equal(gate, expected_gate)
         np.testing.assert_array_equal(up, expected_up)
+
+    def test_qwen35_moe_moveaxis_sanitize_replay(self, tmp_path):
+        path = tmp_path / "qwen35_moe.safetensors"
+        down_proj = np.arange(2 * 3 * 4, dtype=np.float16).reshape(2, 3, 4)
+        _write_safetensors(
+            str(path),
+            {"model.layers.0.mlp.experts.down_proj.weight": down_proj},
+        )
+        idx = _LazyTensorIndex([str(path)])
+
+        def qwen35_moe_style_sanitize(weights):
+            sanitized = {}
+            for k, v in weights.items():
+                if k.endswith("down_proj.weight"):
+                    sanitized[k] = v.moveaxis(2, 1)
+                else:
+                    sanitized[k] = v
+            return sanitized
+
+        plan = _discover_sanitize_plan(qwen35_moe_style_sanitize, idx)
+        discovered = _DiscoveredPlan(plan, _LazyTensorIndex([str(path)]))
+
+        moved = np.array(discovered.pop("model.layers.0.mlp.experts.down_proj.weight"))
+        expected = np.moveaxis(down_proj, 2, 1)
+
+        assert plan["model.layers.0.mlp.experts.down_proj.weight"]["shape"] == expected.shape
+        np.testing.assert_array_equal(moved, expected)
 
     def test_discovered_plan_pop_lazy_passthrough(self, sf_file):
         path, _ = sf_file
