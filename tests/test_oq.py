@@ -518,11 +518,17 @@ class TestMakePredicate:
 
 class TestEstimateMemory:
     def test_streaming_includes_buffer(self):
-        size = 100 * 1024**3  # 100GB model
+        size = 10 * 1024**3  # 10GB model
         result = estimate_memory(size)
         # Streaming: source + 6GB buffer
         assert result["peak_bytes"] > size
-        assert result["peak_bytes"] < size * 1.2
+        assert result["peak_bytes"] == size + 6 * 1024**3
+
+    def test_low_memory_mode_bounds_large_model_peak(self):
+        size = 100 * 1024**3  # 100GB model
+        result = estimate_memory(size)
+        assert result["peak_bytes"] == 16 * 1024**3
+        assert result["peak_bytes"] < size
 
     def test_has_formatted(self):
         result = estimate_memory(10 * 1024**3)
@@ -1278,10 +1284,10 @@ class TestDiscoverSanitizePlan:
         plan = _discover_sanitize_plan(qwen35_moe_style_sanitize, idx)
         discovered = _DiscoveredPlan(plan, _LazyTensorIndex([str(path)]))
 
-        moved = np.array(discovered.pop("model.layers.0.mlp.experts.down_proj.weight"))
         expected = np.moveaxis(down_proj, 2, 1)
-
         assert plan["model.layers.0.mlp.experts.down_proj.weight"]["shape"] == expected.shape
+
+        moved = np.array(discovered.pop("model.layers.0.mlp.experts.down_proj.weight"))
         np.testing.assert_array_equal(moved, expected)
 
     def test_discovered_plan_pop_lazy_passthrough(self, sf_file):
