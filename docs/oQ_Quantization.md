@@ -28,6 +28,7 @@ Quantization should not be exclusive to any particular inference server. oQ prod
 
 | Level | Base Bits | Target bpw | Description |
 |-------|-----------|------------|-------------|
+| oQ2.5 | 2 | ~2.5 | Tight memory / minimum size |
 | oQ2 | 2 | ~2.9 | Extreme compression |
 | oQ3 | 3 | ~3.5 | Balanced |
 | oQ3.5 | 3 | ~3.8 | Quality balanced |
@@ -39,6 +40,11 @@ Quantization should not be exclusive to any particular inference server. oQ prod
 Base format is affine quantization (group_size=64) for all levels except 8-bit, which uses mxfp8 (group_size=32).
 
 oQ and oQ+ share the same levels. oQ+ adds GPTQ-based weight optimization before quantization.
+
+The admin quantizer also exposes optional precise BPW controls. A custom target
+keeps the same base bit-width as the selected preset but tightens or loosens the
+mixed-precision boost budget. Custom outputs include `-bpwX` and, when the hard
+cap is explicit, `-capY` in the directory name.
 
 ## Pipeline
 

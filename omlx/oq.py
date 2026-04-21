@@ -4,7 +4,7 @@
 Mixed-precision quantization combining GGUF K-quant layer position strategy,
 unsloth Dynamic 2.0 selective non-quantization, and BnB MSE-optimal clipping.
 
-Supported levels: oQ2, oQ3, oQ4, oQ6, oQ8 (base bits differ, same predicate).
+Supported levels: oQ2, oQ2.5, oQ3, oQ3.5, oQ4, oQ5, oQ6, oQ8.
 """
 
 import json
@@ -27,20 +27,30 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-OQ_LEVELS = {2, 3, 3.5, 4, 5, 6, 8}
+OQ_LEVELS = {2, 2.5, 3, 3.5, 4, 5, 6, 8}
 
 OQ_DTYPES: tuple[str, ...] = ("bfloat16", "float16")
 
 _OQ_DEFAULT_GROUP_SIZE = 64
 
-_LEVEL_BITS: dict[float, int] = {2: 2, 3: 3, 3.5: 3, 4: 4, 5: 5, 6: 6, 8: 8}
+_LEVEL_BITS: dict[float, int] = {
+    2: 2,
+    2.5: 2,
+    3: 3,
+    3.5: 3,
+    4: 4,
+    5: 5,
+    6: 6,
+    8: 8,
+}
 
 _LEVEL_PROTECTION: dict[float, str] = {
-    2: "full", 3: "full", 3.5: "full",
+    2: "full", 2.5: "full", 3: "full", 3.5: "full",
     4: "full", 5: "full", 6: "full", 8: "full",
 }
 
 _OQ_BPW_TARGETS: dict[float, tuple[float, float]] = {
+    2.5: (2.5, 2.6),
     2: (2.8, 3.0),
     3: (3.5, 3.7),
     3.5: (3.8, 4.0),
@@ -53,6 +63,30 @@ _OQ_BPW_TARGETS: dict[float, tuple[float, float]] = {
 def _bpw_targets_for_level(oq_level: float) -> tuple[float, float] | None:
     """Return (target_bpw, hard_cap_bpw) for the given oQ level, or None."""
     return _OQ_BPW_TARGETS.get(oq_level)
+
+
+def _resolve_bpw_targets(
+    oq_level: float,
+    target_bpw: float | None = None,
+    hard_cap_bpw: float | None = None,
+) -> tuple[float, float] | None:
+    """Resolve preset/custom BPW budget targets for a quantization run."""
+    defaults = _bpw_targets_for_level(oq_level)
+    if target_bpw is None and hard_cap_bpw is None:
+        return defaults
+
+    if target_bpw is None:
+        target_bpw = defaults[0] if defaults is not None else hard_cap_bpw
+    if hard_cap_bpw is None:
+        hard_cap_bpw = max(float(target_bpw), float(target_bpw) + 0.1)
+
+    target_bpw = float(target_bpw)
+    hard_cap_bpw = float(hard_cap_bpw)
+    if target_bpw <= 0 or hard_cap_bpw <= 0:
+        raise ValueError("BPW target and hard cap must be positive")
+    if hard_cap_bpw < target_bpw:
+        raise ValueError("BPW hard cap must be greater than or equal to target")
+    return target_bpw, hard_cap_bpw
 
 
 @dataclass
@@ -68,15 +102,15 @@ class QuantPlan:
 
 
 def universal_quant_predicate(
-    path: str, module, config: dict, oq_level: int = 4
+    path: str, module, config: dict, oq_level: float = 4
 ) -> Union[bool, dict]:
     """Per-tensor quantization decision based on GGUF/unsloth/llama.cpp rules.
 
     Protection levels vary by oQ level:
-        oQ2: minimal protection (router fp16, lm_head 4-bit only) → ~2.5 bpw
-        oQ3: base 2-bit + full protection → ~3.3 bpw
+        oQ2.5: base 2-bit + tight boost budget → ~2.5 bpw
+        oQ2: base 2-bit + stronger protection → ~2.9 bpw
+        oQ3: base 3-bit + full protection → ~3.5 bpw
         oQ4-oQ6: base N-bit + full protection
-        oQ7: base 8-bit + full protection
         oQ8: near-uniform 8-bit (router fp16 only) → ~8.0 bpw
 
     Args:
@@ -321,7 +355,7 @@ def _normalize_quant_path(path: str) -> str:
     return path
 
 
-def _base_bits_for_level(oq_level: int) -> int:
+def _base_bits_for_level(oq_level: float) -> int:
     return int(_LEVEL_BITS.get(oq_level, oq_level))
 
 
@@ -446,7 +480,7 @@ def _sensitivity_tier(layer_score: float, max_score: float) -> int:
 def _build_quant_plan(
     named_shapes: dict[str, tuple],
     config: dict,
-    oq_level: int,
+    oq_level: float,
     target_bpw: float = 4.6,
     hard_cap_bpw: float = 4.7,
 ) -> QuantPlan:
@@ -685,7 +719,11 @@ def _build_quant_plan(
 
 
 def resolve_output_name(
-    model_name: str, oq_level: int, dtype: str = "bfloat16"
+    model_name: str,
+    oq_level: float,
+    dtype: str = "bfloat16",
+    target_bpw: float | None = None,
+    hard_cap_bpw: float | None = None,
 ) -> str:
     """Generate output model name: strip existing quant suffixes, append oQ tag.
 
@@ -698,7 +736,7 @@ def resolve_output_name(
         "Qwen3.5-122B-A10B-oQ6-fp16" + 2 + bfloat16 -> "Qwen3.5-122B-A10B-oQ2"
     """
     pattern = re.compile(
-        r"-(oQ[\d.]+e?|[0-9]+[_-]?bit|fp\d+|bf\d+)$",
+        r"-(cap[\d.]+|bpw[\d.]+|oQ[\d.]+e?|[0-9]+[_-]?bit|fp\d+|bf\d+)$",
         flags=re.IGNORECASE,
     )
     base = model_name
@@ -709,6 +747,22 @@ def resolve_output_name(
         base = new
     level_str = f"{oq_level:g}"
     suffix = f"-oQ{level_str}"
+    defaults = _bpw_targets_for_level(oq_level)
+    if target_bpw is not None or hard_cap_bpw is not None:
+        resolved_target, resolved_cap = _resolve_bpw_targets(
+            oq_level, target_bpw, hard_cap_bpw
+        )
+        custom_target = (
+            defaults is None or abs(resolved_target - defaults[0]) > 1e-6
+        )
+        custom_cap = (
+            hard_cap_bpw is not None
+            and (defaults is None or abs(resolved_cap - defaults[1]) > 1e-6)
+        )
+        if custom_target or custom_cap:
+            suffix += f"-bpw{resolved_target:g}"
+            if custom_cap:
+                suffix += f"-cap{resolved_cap:g}"
     if dtype == "float16":
         suffix += "-fp16"
     return f"{base}{suffix}"
@@ -1694,7 +1748,7 @@ def validate_quantizable(config: dict) -> bool:
     return True
 
 
-def make_predicate(config: dict, oq_level: int = 4) -> Callable:
+def make_predicate(config: dict, oq_level: float = 4) -> Callable:
     """Create a quant_predicate closure for mlx-lm's quantize_model."""
 
     def predicate(path: str, module) -> Union[bool, dict]:
@@ -1703,7 +1757,13 @@ def make_predicate(config: dict, oq_level: int = 4) -> Callable:
     return predicate
 
 
-def estimate_bpw_and_size(model_path: str, oq_level: int, group_size: int = 64) -> dict:
+def estimate_bpw_and_size(
+    model_path: str,
+    oq_level: float,
+    group_size: int = 64,
+    target_bpw: float | None = None,
+    hard_cap_bpw: float | None = None,
+) -> dict:
     """Calculate precise effective bpw and output size by scanning actual tensors.
 
     Applies the universal predicate to each tensor to determine its bit width,
@@ -1728,7 +1788,7 @@ def estimate_bpw_and_size(model_path: str, oq_level: int, group_size: int = 64) 
                 "output_size_formatted": "?"}
 
     # Build budget plan for accurate estimate (position-based sensitivity)
-    _level_targets = _bpw_targets_for_level(oq_level)
+    _level_targets = _resolve_bpw_targets(oq_level, target_bpw, hard_cap_bpw)
     if _level_targets is not None:
         config["_oq_use_budget_plan"] = True
         config["_oq_sensitivity_map"] = _position_sensitivity_map(config)
@@ -2035,7 +2095,7 @@ def _build_non_quantizable_set(config: dict) -> set:
         return set()
 
 
-def _get_predicate_bits(tensor_name: str, config: dict, oq_level: int,
+def _get_predicate_bits(tensor_name: str, config: dict, oq_level: float,
                         group_size: int) -> tuple:
     """Get quantization bits, group_size, and mode for a tensor.
 
@@ -2353,7 +2413,7 @@ def _quantize_chunked(w, group_size, bits, mode, target_dtype=None):
 def quantize_oq_streaming(
     model_path: str,
     output_path: str,
-    oq_level: int,
+    oq_level: float,
     group_size: int = 64,
     progress_callback: Optional[Callable[[str, float], None]] = None,
     text_only: bool = False,
@@ -2402,7 +2462,8 @@ def quantize_oq_streaming(
     config_path = source / "config.json"
     with open(config_path) as f:
         config = json.load(f)
-    config["_oq_use_budget_plan"] = oq_level in _OQ_BPW_TARGETS
+    resolved_bpw_targets = _resolve_bpw_targets(oq_level, target_bpw, hard_cap_bpw)
+    config["_oq_use_budget_plan"] = resolved_bpw_targets is not None
 
     cb("loading", 5.0)
 
@@ -2525,10 +2586,8 @@ def quantize_oq_streaming(
         named_shapes = {
             k: v for k, v in named_shapes.items() if not _is_vision_tensor(k)
         }
-    _level_targets = _bpw_targets_for_level(oq_level)
-    if _level_targets is not None:
-        _t = target_bpw if target_bpw is not None else _level_targets[0]
-        _c = hard_cap_bpw if hard_cap_bpw is not None else _level_targets[1]
+    if resolved_bpw_targets is not None:
+        _t, _c = resolved_bpw_targets
         plan = _build_quant_plan(
             named_shapes, config, oq_level, target_bpw=_t, hard_cap_bpw=_c,
         )

@@ -20,6 +20,7 @@ from omlx.oq import (
     _OQ_BPW_TARGETS,
     _LazyTensor,
     _TrackedTensor,
+    _base_bits_for_level,
     _bpw_targets_for_level,
     _build_quant_plan,
     _discover_sanitize_plan,
@@ -32,6 +33,7 @@ from omlx.oq import (
     _normalize_quant_path,
     _position_sensitivity_map,
     _quantize_chunked,
+    _resolve_bpw_targets,
     _should_quantize_tensor,
     _should_use_low_memory_mode,
     estimate_memory,
@@ -396,10 +398,33 @@ class TestResolveOutputName:
     def test_strip_existing_enhanced_suffix(self):
         assert resolve_output_name("Qwen3.5-122B-A10B-oQ4e", 2) == "Qwen3.5-122B-A10B-oQ2"
 
+    def test_oq25_suffix(self):
+        assert resolve_output_name("Qwen3.5-122B-A10B", 2.5) == "Qwen3.5-122B-A10B-oQ2.5"
+
+    def test_custom_bpw_suffix(self):
+        assert (
+            resolve_output_name("Qwen3.5-122B-A10B", 2, target_bpw=2.55)
+            == "Qwen3.5-122B-A10B-oQ2-bpw2.55"
+        )
+
+    def test_custom_bpw_cap_suffix(self):
+        assert (
+            resolve_output_name(
+                "Qwen3.5-122B-A10B", 2, target_bpw=2.55, hard_cap_bpw=2.62
+            )
+            == "Qwen3.5-122B-A10B-oQ2-bpw2.55-cap2.62"
+        )
+
+    def test_strip_existing_custom_bpw_suffix(self):
+        assert (
+            resolve_output_name("Model-oQ2-bpw2.55-cap2.62", 2.5)
+            == "Model-oQ2.5"
+        )
+
     def test_all_levels(self):
         for level in OQ_LEVELS:
             result = resolve_output_name("Model-7B", level)
-            assert result == f"Model-7B-oQ{level}"
+            assert result == f"Model-7B-oQ{level:g}"
 
     def test_bfloat16_default_no_suffix(self):
         assert resolve_output_name("Llama-3-8B", 4, "bfloat16") == "Llama-3-8B-oQ4"
@@ -586,6 +611,7 @@ class TestLevelBudgetPlan:
     """Tests for per-level target_bpw and budget plan activation."""
 
     def test_bpw_targets_for_level_returns_correct_values(self):
+        assert _bpw_targets_for_level(2.5) == (2.5, 2.6)
         assert _bpw_targets_for_level(3) == (3.5, 3.7)
         assert _bpw_targets_for_level(3.5) == (3.8, 4.0)
         assert _bpw_targets_for_level(4) == (4.6, 4.7)
@@ -602,6 +628,16 @@ class TestLevelBudgetPlan:
     def test_budget_plan_oq2_enabled(self):
         assert 2 in _OQ_BPW_TARGETS
         assert _bpw_targets_for_level(2) == (2.8, 3.0)
+
+    def test_budget_plan_oq25_enabled(self):
+        assert 2.5 in _OQ_BPW_TARGETS
+        assert _base_bits_for_level(2.5) == 2
+        assert _bpw_targets_for_level(2.5) == (2.5, 2.6)
+
+    def test_resolve_custom_bpw_targets_defaults_cap(self):
+        target, cap = _resolve_bpw_targets(2, 2.55, None)
+        assert target == pytest.approx(2.55)
+        assert cap == pytest.approx(2.65)
 
     def test_budget_plan_oq8_not_enabled(self):
         assert 8 not in _OQ_BPW_TARGETS
@@ -724,6 +760,26 @@ class TestLevelBudgetPlan:
         )
         assert plan.effective_bpw <= 3.0
         assert plan.boost_map
+
+    def test_oq25_budget_plan_respects_tight_cap(self):
+        """oQ2.5 keeps the 2-bit base format under a tighter hard cap."""
+        named_shapes = {"lm_head": (4096, 32000)}
+        for i in range(32):
+            named_shapes[f"model.layers.{i}.self_attn.v_proj"] = (4096, 4096)
+            named_shapes[f"model.layers.{i}.self_attn.q_proj"] = (4096, 4096)
+            named_shapes[f"model.layers.{i}.mlp.gate_proj"] = (14336, 4096)
+            named_shapes[f"model.layers.{i}.mlp.up_proj"] = (14336, 4096)
+            named_shapes[f"model.layers.{i}.mlp.down_proj"] = (4096, 14336)
+        config = {
+            "num_hidden_layers": 32,
+            "_oq_use_budget_plan": True,
+            "_oq_sensitivity_map": {str(i): 0.1 / (i + 1) for i in range(32)},
+        }
+        plan = _build_quant_plan(
+            named_shapes, config, 2.5, target_bpw=2.5, hard_cap_bpw=2.6
+        )
+        assert plan.effective_bpw <= 2.6
+        assert all(v["bits"] > 2 for v in plan.boost_map.values())
 
     def test_oq2_moe_protection_floor(self):
         """oQ2 MoE: protection floor boosts attention, experts stay 2bit."""

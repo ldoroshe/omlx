@@ -1023,7 +1023,7 @@
 
                     <!-- ==================== QUANTIZER TAB ==================== -->
                     <div x-show="modelsTab === 'quantizer'" x-cloak
-                         x-effect="oqSelectedModelPath; oqLevel; oqRefreshEstimate()">
+                         x-effect="oqSelectedModelPath; oqLevel; oqTargetBpw; oqHardCapBpw; oqRefreshEstimate()">
                         <!-- Header -->
                         <div class="mb-8">
                             <h2 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-2">{{ t('models.oq.section_label') }}</h2>
@@ -1077,6 +1077,7 @@
                                         <select x-model.number="oqLevel"
                                                 class="w-full px-4 py-2.5 bg-white border border-neutral-300 rounded-xl text-sm text-neutral-900 focus:outline-none focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
                                             <option value="2">oQ2</option>
+                                            <option value="2.5">oQ2.5</option>
                                             <option value="3">oQ3</option>
                                             <option value="3.5">oQ3.5</option>
                                             <option value="4" selected>oQ4</option>
@@ -1141,6 +1142,31 @@
                                                         class="px-3 py-1.5 text-xs font-medium rounded-full transition-colors">
                                                     float16
                                                 </button>
+                                            </div>
+                                        </div>
+                                        <!-- Precise BPW budget -->
+                                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                                            <div>
+                                                <label class="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1.5">Target BPW</label>
+                                                <input type="number"
+                                                       min="2.5"
+                                                       max="8"
+                                                       step="0.05"
+                                                       x-model="oqTargetBpw"
+                                                       placeholder="Preset"
+                                                       class="w-full px-3 py-2 bg-white border border-neutral-300 rounded-xl text-sm text-neutral-900 placeholder-neutral-400 focus:outline-none focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                <p class="text-xs text-neutral-400 mt-1 leading-relaxed">Optional precise output budget. For tight memory, try oQ2.5 or oQ2 with target 2.5.</p>
+                                            </div>
+                                            <div>
+                                                <label class="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1.5">Hard Cap BPW</label>
+                                                <input type="number"
+                                                       min="2.5"
+                                                       max="8"
+                                                       step="0.05"
+                                                       x-model="oqHardCapBpw"
+                                                       placeholder="Target + 0.10"
+                                                       class="w-full px-3 py-2 bg-white border border-neutral-300 rounded-xl text-sm text-neutral-900 placeholder-neutral-400 focus:outline-none focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                <p class="text-xs text-neutral-400 mt-1 leading-relaxed">Planner will refuse boosts above this cap; leave empty for target + 0.10.</p>
                                             </div>
                                         </div>
                                     </div>

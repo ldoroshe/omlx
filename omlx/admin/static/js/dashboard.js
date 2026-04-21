@@ -293,6 +293,8 @@
             oqModelsLoaded: false,
             oqSelectedModelPath: '',
             oqLevel: 4,
+            oqTargetBpw: '',
+            oqHardCapBpw: '',
             oqStarting: false,
             oqTasks: [],
             oqError: '',
@@ -3418,6 +3420,8 @@
                 this.oqSuccess = '';
                 this.oqStarting = true;
                 try {
+                    const targetBpw = this.oqTargetBpw === '' ? null : Number(this.oqTargetBpw);
+                    const hardCapBpw = this.oqHardCapBpw === '' ? null : Number(this.oqHardCapBpw);
                     const response = await fetch('/admin/api/oq/start', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
@@ -3428,6 +3432,8 @@
                             sensitivity_model_path: this.oqSensitivityModelPath,
                             text_only: this.oqTextOnly,
                             dtype: this.oqDtype,
+                            target_bpw: targetBpw,
+                            hard_cap_bpw: hardCapBpw,
                         }),
                     });
                     const data = await response.json().catch(() => ({}));
@@ -3576,6 +3582,8 @@
                             model_path: this.oqSelectedModelPath,
                             oq_level: this.oqLevel,
                         });
+                        if (this.oqTargetBpw !== '') params.set('target_bpw', this.oqTargetBpw);
+                        if (this.oqHardCapBpw !== '') params.set('hard_cap_bpw', this.oqHardCapBpw);
                         const resp = await fetch(`/admin/api/oq/estimate?${params}`);
                         if (resp.ok) {
                             this.oqEstimate = await resp.json();

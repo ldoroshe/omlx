@@ -284,6 +284,8 @@ class OQStartRequest(BaseModel):
     sensitivity_model_path: str = ""
     text_only: bool = False
     dtype: str = "bfloat16"
+    target_bpw: Optional[float] = None
+    hard_cap_bpw: Optional[float] = None
 
 
 class HFUploadRequest(BaseModel):
@@ -4470,6 +4472,8 @@ async def list_oq_models(is_admin: bool = Depends(require_admin)):
 async def estimate_oq(
     model_path: str,
     oq_level: float,
+    target_bpw: Optional[float] = None,
+    hard_cap_bpw: Optional[float] = None,
     is_admin: bool = Depends(require_admin),
 ):
     """Estimate effective bpw and output size for a model at given oQ level."""
@@ -4477,7 +4481,12 @@ async def estimate_oq(
 
     try:
         result = await asyncio.to_thread(
-            estimate_bpw_and_size, model_path, oq_level
+            estimate_bpw_and_size,
+            model_path,
+            oq_level,
+            64,
+            target_bpw,
+            hard_cap_bpw,
         )
         return result
     except Exception as e:
@@ -4494,16 +4503,25 @@ async def start_oq_quantization(
         raise HTTPException(
             status_code=503, detail="oQ quantizer not initialized"
         )
-    if request.oq_level not in (2, 3, 3.5, 4, 5, 6, 8):
+    if request.oq_level not in (2, 2.5, 3, 3.5, 4, 5, 6, 8):
         raise HTTPException(
             status_code=400,
-            detail="Invalid oQ level. Must be 2, 3, 4, 5, 6, or 8",
+            detail="Invalid oQ level. Must be 2, 2.5, 3, 3.5, 4, 5, 6, or 8",
         )
     if request.dtype not in ("bfloat16", "float16"):
         raise HTTPException(
             status_code=400,
             detail="Invalid dtype. Must be 'bfloat16' or 'float16'",
         )
+    if request.target_bpw is not None or request.hard_cap_bpw is not None:
+        from ..oq import _resolve_bpw_targets
+
+        try:
+            _resolve_bpw_targets(
+                request.oq_level, request.target_bpw, request.hard_cap_bpw
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
     try:
         task = await _oq_manager.start_quantization(
             model_path=request.model_path,
@@ -4512,6 +4530,8 @@ async def start_oq_quantization(
             sensitivity_model_path=request.sensitivity_model_path,
             text_only=request.text_only,
             dtype=request.dtype,
+            target_bpw=request.target_bpw,
+            hard_cap_bpw=request.hard_cap_bpw,
         )
         return {"success": True, "task": task.to_dict()}
     except ValueError as e:

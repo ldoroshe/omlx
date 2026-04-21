@@ -74,6 +74,8 @@ class QuantTask:
     sensitivity_model_path: str = ""
     text_only: bool = False
     dtype: str = "bfloat16"
+    target_bpw: Optional[float] = None
+    hard_cap_bpw: Optional[float] = None
 
     def to_dict(self) -> dict:
         """Serialize task to JSON-compatible dict."""
@@ -94,6 +96,8 @@ class QuantTask:
             "source_size": self.source_size,
             "output_size": self.output_size,
             "dtype": self.dtype,
+            "target_bpw": self.target_bpw,
+            "hard_cap_bpw": self.hard_cap_bpw,
         }
 
 
@@ -222,12 +226,14 @@ class OQManager:
         sensitivity_model_path: str = "",
         text_only: bool = False,
         dtype: str = "bfloat16",
+        target_bpw: Optional[float] = None,
+        hard_cap_bpw: Optional[float] = None,
     ) -> QuantTask:
         """Start a quantization job.
 
         Args:
             model_path: Path to source model directory.
-            oq_level: oQ level (2, 3, 4, 6, or 8).
+            oq_level: oQ level.
             dtype: Target fp dtype for non-quantized weights and quant
                 scales/biases. "bfloat16" (default) or "float16".
 
@@ -237,7 +243,12 @@ class OQManager:
         Raises:
             ValueError: On invalid inputs or output conflict.
         """
-        from ..oq import OQ_DTYPES, OQ_LEVELS, resolve_output_name
+        from ..oq import (
+            OQ_DTYPES,
+            OQ_LEVELS,
+            _resolve_bpw_targets,
+            resolve_output_name,
+        )
 
         if oq_level not in OQ_LEVELS:
             raise ValueError(
@@ -247,13 +258,20 @@ class OQManager:
             raise ValueError(
                 f"Invalid dtype {dtype!r}. Must be one of {OQ_DTYPES}"
             )
+        _resolve_bpw_targets(oq_level, target_bpw, hard_cap_bpw)
 
         source = Path(model_path)
         if not source.exists() or not (source / "config.json").exists():
             raise ValueError(f"Model not found: {model_path}")
 
         model_name = source.name
-        output_name = resolve_output_name(model_name, oq_level, dtype)
+        output_name = resolve_output_name(
+            model_name,
+            oq_level,
+            dtype,
+            target_bpw=target_bpw,
+            hard_cap_bpw=hard_cap_bpw,
+        )
         output_path = self._output_dir / output_name
 
         if output_path.exists():
@@ -268,6 +286,8 @@ class OQManager:
                 task.model_path == model_path
                 and task.oq_level == oq_level
                 and task.dtype == dtype
+                and task.target_bpw == target_bpw
+                and task.hard_cap_bpw == hard_cap_bpw
                 and task.status in _ACTIVE_STATUSES
             ):
                 raise ValueError(
@@ -294,6 +314,8 @@ class OQManager:
             sensitivity_model_path=sensitivity_model_path,
             text_only=text_only,
             dtype=dtype,
+            target_bpw=target_bpw,
+            hard_cap_bpw=hard_cap_bpw,
         )
         self._tasks[task_id] = task
 
@@ -446,8 +468,8 @@ class OQManager:
                     task.group_size,
                     _progress_cb,
                     task.text_only,
-                    None,  # target_bpw
-                    None,  # hard_cap_bpw
+                    task.target_bpw,
+                    task.hard_cap_bpw,
                     task.sensitivity_model_path,
                     task.dtype,
                 )
