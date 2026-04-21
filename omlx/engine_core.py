@@ -362,10 +362,10 @@ class EngineCore:
     async def abort_request(self, request_id: str) -> bool:
         """Abort a request.
 
-        Uses deferred abort pattern: scheduler.abort_request() just enqueues
-        the request ID into a thread-safe set. The actual abort is processed
-        at the start of the next scheduler.step() call, ensuring it runs in
-        the same execution context as generation (no race conditions).
+        Uses the deferred abort pattern for thread safety, then drains the
+        pending abort queue on the MLX executor before returning. This keeps
+        abort cleanup in the same execution context as generation while
+        preventing a disconnected stream from contaminating the next request.
 
         Signals the consumer (stream_outputs/generate) with an abort error
         so it can exit gracefully. Cleanup is handled by the consumer's
@@ -373,6 +373,15 @@ class EngineCore:
         after put() would clear the output before the consumer can drain it.
         """
         result = self.scheduler.abort_request(request_id)
+
+        # Process the abort promptly on the same single-worker MLX executor
+        # used by scheduler.step().  Relying only on the next engine-loop tick
+        # leaves a small but real window where a cancelled stream can continue
+        # generating and leak state/output into following requests.
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            self._mlx_executor, self.scheduler._process_pending_aborts
+        )
 
         # Signal consumer with abort error so any waiting
         # stream_outputs() / generate() can exit gracefully.
@@ -422,6 +431,10 @@ class EngineCore:
             if event is not None:
                 event.set()
         if request_ids:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                self._mlx_executor, self.scheduler._process_pending_aborts
+            )
             logger.warning(
                 f"Aborted {len(request_ids)} requests due to memory pressure"
             )

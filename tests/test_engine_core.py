@@ -344,15 +344,18 @@ class TestEngineCoreAbortRequest:
                 engine.close()
 
     @pytest.mark.asyncio
-    async def test_abort_request_no_ghost_in_scheduler(
+    async def test_abort_request_drains_scheduler_state(
         self, mock_model, mock_tokenizer
     ):
-        """Deferred abort must clean scheduler state (no ghost request).
+        """abort_request must clean scheduler state before returning.
 
         Regression: _cleanup_request used to call remove_finished_request()
         which deleted from scheduler.requests before the deferred abort ran,
         causing _do_abort_request to skip cleanup and leave ghost state in
         scheduler.running / uid mappings / active batch.
+
+        A later regression left aborts queued until the next scheduler step,
+        allowing disconnected streams to contaminate the next request.
         """
         with patch("omlx.engine_core.get_registry") as mock_registry:
             mock_registry.return_value.acquire.return_value = True
@@ -372,10 +375,8 @@ class TestEngineCoreAbortRequest:
                 # abort_request signals consumer but does not clean up
                 assert request_id in engine._output_collectors
 
-                # Process the deferred abort (normally happens in step())
-                engine.scheduler._process_pending_aborts()
-
                 # Scheduler state must be fully cleaned
+                assert not engine.scheduler._pending_abort_ids
                 assert request_id not in engine.scheduler.requests
                 assert request_id not in engine.scheduler.running
                 assert request_id not in engine.scheduler.request_id_to_uid
@@ -839,8 +840,6 @@ class TestEngineCoreAbortAllRequests:
             engine = EngineCore(model=mock_model, tokenizer=mock_tokenizer)
 
             try:
-                await engine.start()
-
                 # Add multiple requests
                 rid1 = await engine.add_request(prompt="Hello")
                 rid2 = await engine.add_request(prompt="World")
@@ -848,9 +847,11 @@ class TestEngineCoreAbortAllRequests:
                 # Abort all
                 count = await engine.abort_all_requests()
                 assert count == 2
+                assert not engine.scheduler._pending_abort_ids
 
                 # Collectors should have error outputs
                 for rid in [rid1, rid2]:
+                    assert rid not in engine.scheduler.requests
                     collector = engine._output_collectors.get(rid)
                     if collector is not None:
                         output = collector.get_nowait()

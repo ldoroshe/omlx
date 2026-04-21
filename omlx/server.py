@@ -1325,6 +1325,13 @@ async def _with_sse_keepalive(
 
     try:
         while True:
+            if http_request is not None:
+                try:
+                    if await http_request.is_disconnected():
+                        logger.info("Client disconnected during streaming, closing SSE generator")
+                        return
+                except Exception as e:
+                    logger.debug(f"is_disconnected() check failed: {e}")
             task = asyncio.ensure_future(_safe_anext(ait))
             keepalive_elapsed = 0.0
             while not task.done():
@@ -1374,7 +1381,12 @@ async def _with_sse_keepalive(
             except (asyncio.CancelledError, StopAsyncIteration):
                 pass
         if hasattr(ait, 'aclose'):
-            await ait.aclose()
+            try:
+                await ait.aclose()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.debug(f"SSE generator close failed: {e}")
 
 
 async def _run_with_disconnect_guard(

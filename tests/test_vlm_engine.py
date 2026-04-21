@@ -298,6 +298,68 @@ class TestApplyChatTemplate:
 
 
 # ---------------------------------------------------------------------------
+# TestSamplingParams
+# ---------------------------------------------------------------------------
+
+class TestSamplingParams:
+    """Tests for VLM sampling parameter forwarding."""
+
+    @pytest.mark.asyncio
+    async def test_generate_forwards_frequency_penalty(self):
+        """VLM non-streaming generation should honor API frequency_penalty."""
+        from omlx.request import RequestOutput
+
+        engine = _make_loaded_engine()
+        engine._engine.generate = AsyncMock(
+            return_value=RequestOutput(
+                request_id="req-1",
+                output_text="done",
+                prompt_tokens=1,
+                completion_tokens=1,
+                finished=True,
+                finish_reason="stop",
+            )
+        )
+
+        await engine.generate("prompt", frequency_penalty=0.35)
+
+        sampling_params = engine._engine.generate.call_args.kwargs["sampling_params"]
+        assert sampling_params.frequency_penalty == 0.35
+
+    @pytest.mark.asyncio
+    async def test_stream_generate_forwards_frequency_penalty(self):
+        """VLM streaming generation should honor API frequency_penalty."""
+        from omlx.request import RequestOutput
+
+        engine = _make_loaded_engine()
+        engine._engine.add_request = AsyncMock(return_value="req-1")
+
+        async def stream_outputs(request_id):
+            yield RequestOutput(
+                request_id=request_id,
+                output_text="done",
+                new_text="done",
+                prompt_tokens=1,
+                completion_tokens=1,
+                finished=True,
+                finish_reason="stop",
+            )
+
+        engine._engine.stream_outputs = stream_outputs
+
+        outputs = [
+            output
+            async for output in engine.stream_generate(
+                "prompt", frequency_penalty=0.35
+            )
+        ]
+
+        assert outputs[0].new_text == "done"
+        sampling_params = engine._engine.add_request.call_args.kwargs["sampling_params"]
+        assert sampling_params.frequency_penalty == 0.35
+
+
+# ---------------------------------------------------------------------------
 # TestApplyOcrPrompt
 # ---------------------------------------------------------------------------
 

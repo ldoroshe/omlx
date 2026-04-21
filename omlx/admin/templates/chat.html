@@ -915,6 +915,7 @@
             isStreaming: false,
             streamingContent: '',
             abortController: null,
+            streamReader: null,
 
             // Thinking streaming state
             thinkingState: {
@@ -1494,6 +1495,7 @@
                     });
                 }
 
+                let reader = null;
                 try {
                     const response = await fetch('/v1/chat/completions', {
                         method: 'POST',
@@ -1516,7 +1518,8 @@
                         throw new Error(errorText || `Error: ${response.status}`);
                     }
 
-                    const reader = response.body.getReader();
+                    reader = response.body.getReader();
+                    this.streamReader = reader;
                     const decoder = new TextDecoder();
                     let buffer = '';
                     const toolCallsMap = {}; // accumulate streaming tool_call chunks by index
@@ -1792,12 +1795,21 @@
                     this._toolTimers = {};
                     this.stopPrefillPolling();
                     this.abortController = null;
+                    if (this.streamReader === reader) {
+                        this.streamReader = null;
+                    }
                     this.thinkingAutoScroll = true;
                 }
             },
 
             stopStreaming() {
                 console.log('[stopStreaming] called, abortController:', this.abortController);
+                this.setEngineStatus({ text: 'Stopping' });
+                if (this.streamReader) {
+                    this.streamReader.cancel().catch((error) => {
+                        console.debug('[stopStreaming] reader.cancel() failed:', error);
+                    });
+                }
                 if (this.abortController) {
                     console.log('[stopStreaming] calling abort()');
                     this.abortController.abort();

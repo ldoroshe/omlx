@@ -92,3 +92,32 @@ class TestSSEKeepaliveExceptionHandling:
         # No error items
         error_items = [i for i in items if i.startswith("data: {")]
         assert len(error_items) == 0
+
+    @pytest.mark.asyncio
+    async def test_disconnect_checked_between_fast_chunks(self):
+        """Fast token streams should still notice client disconnects."""
+        closed = False
+
+        class FakeRequest:
+            def __init__(self):
+                self.calls = 0
+
+            async def is_disconnected(self):
+                self.calls += 1
+                return self.calls >= 2
+
+        async def gen():
+            nonlocal closed
+            try:
+                for i in range(10):
+                    yield f"data: chunk{i}\n\n"
+            finally:
+                closed = True
+
+        request = FakeRequest()
+        items = await _collect(
+            _with_sse_keepalive(gen(), http_request=request, disconnect_poll=0.001)
+        )
+
+        assert items == [": keep-alive\n\n", "data: chunk0\n\n"]
+        assert closed is True
